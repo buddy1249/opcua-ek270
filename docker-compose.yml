@@ -1,0 +1,12 @@
+version: '3.8'
+
+services:
+  gateway:
+    build: .
+    container_name: ek270_gateway
+    devices:
+      - "/dev/ttyUSB0:/dev/ttyUSB0"
+    ports:
+      - "8000:8000"
+    restart: always
+
