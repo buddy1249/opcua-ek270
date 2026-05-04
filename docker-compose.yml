@@ -1,12 +1,15 @@
 version: '3.8'
-
 services:
   gateway:
     build: .
-    container_name: ek270_gateway
-    devices:
-      - "/dev/ttyUSB0:/dev/ttyUSB0"
-    ports:
-      - "8000:8000"
+    container_name: can_gateway
+    network_mode: host
+    command: python -u main.py  
     restart: always
 
+  emulator:
+    build: .
+    container_name: can_emulator
+    network_mode: host
+    command: python -u emulator.py  
+    restart: always

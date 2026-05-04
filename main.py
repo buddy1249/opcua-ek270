@@ -1,63 +1,87 @@
 import asyncio
+import struct
+import can
 import uvicorn
 from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
-from pymodbus.client import ModbusSerialClient
-import settings
+from asyncua import Server, ua
 
-app = FastAPI(title="EK270 Final Gateway")
+app = FastAPI(title="CAN Telemetry Gateway")
 
-# 1. Разрешение(CORS)
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# Глобальное хранилище данных
+storage = {"voltage": 0.0, "current": 0.0, "status": "searching_bus"}
+opcua_nodes = {}
 
-storage = {key: 0.0 for key in settings.REGISTER_MAP}
-storage["status"] = "starting"
-active_connections = set()
-
-async def modbus_poller():
-    while True:
-        client = ModbusSerialClient(**settings.SERIAL_CONFIG)
-        try:
-            if client.connect():
-                for tag, params in settings.REGISTER_MAP.items():
-                    res = client.read_holding_registers(address=params["address"], count=params["count"], slave=settings.SLAVE_ID)
-                    if not res.isError():
-                        from pymodbus.payload import BinaryPayloadDecoder
-                        from pymodbus.constants import Endian
-                        # Используем декодер 
-                        decoder = BinaryPayloadDecoder.fromRegisters(res.registers, byteorder=Endian.BIG, wordorder=Endian.BIG)
-                        storage[tag] = round(decoder.decode_32bit_float(), 4)
-                        storage["status"] = "online"
-                client.close()
-                
-                # Рассылаем данные всем подключенным по WS
-                if active_connections:
-                    message = {"type": "update", "data": storage}
-                    for ws in list(active_connections):
-                        try:
-                            await ws.send_json(message)
-                        except:
-                            active_connections.remove(ws)
-            else:
-                storage["status"] = "offline"
-        except Exception as e:
-            storage["status"] = f"error: {str(e)}"
+async def init_opcua():
+    """Настройка и запуск OPC UA сервера"""
+    try:
+        server = Server()
+        await server.init()
+        # В режиме host используем 0.0.0.0
+        server.set_endpoint("opc.tcp://0.0.0.0:4840/freeopcua/server/")
         
-        await asyncio.sleep(settings.POLL_INTERVAL)
+        uri = "http://buro1440.can"
+        idx = await server.register_namespace(uri)
+        
+        # Создаем объект и переменные в дереве OPC UA
+        obj = await server.nodes.objects.add_object(idx, "Satellite_Data")
+        opcua_nodes["v"] = await obj.add_variable(idx, "Voltage", 0.0)
+        opcua_nodes["i"] = await obj.add_variable(idx, "Current", 0.0)
+        
+        # Разрешаем запись в ноды (для клиентов)
+        for node in opcua_nodes.values():
+            await node.set_writable()
+            
+        await server.start()
+        print("🚀 OPC UA Server started on port 4840")
+        return server
+    except Exception as e:
+        print(f"❌ OPC UA Error: {e}")
+
+async def can_reader():
+    """Читает данные из SocketCAN vcan0"""
+    global storage # Указываем, что работаем с глобальным словарем
+    print("📡 CAN Reader started on vcan0...")
+    
+    while True:
+        try:
+            with can.interface.Bus(channel='vcan0', interface='socketcan') as bus:
+                storage["status"] = "connected"
+                while True:
+                    msg = bus.recv(timeout=1.0)
+                    if msg:
+                        # Разбор Напряжения
+                        if msg.arbitration_id == 0x101:
+                            # unpack возвращает кортеж (val,), берем первый элемент [0]
+                            val = struct.unpack('>f', msg.data)[0]
+                            storage["voltage"] = round(float(val), 2)
+                            if "v" in opcua_nodes:
+                                await opcua_nodes["v"].write_value(float(val))
+                        
+                        # Разбор Тока
+                        elif msg.arbitration_id == 0x102:
+                            val = struct.unpack('>f', msg.data)[0]
+                            storage["current"] = round(float(val), 2)
+                            if "i" in opcua_nodes:
+                                await opcua_nodes["i"].write_value(float(val))
+                                
+                    await asyncio.sleep(0.01)
+        except Exception as e:
+            print(f"❌ CAN Error: {e}")
+            storage["status"] = f"error: {e}"
+            await asyncio.sleep(5)
 
 @app.on_event("startup")
-async def startup_event():
-    asyncio.create_task(modbus_poller())
+async def startup():
+    # 1. Сначала запускаем OPC UA
+    await init_opcua()
+    # 2. Затем запускаем поллер в фоне
+    asyncio.create_task(can_reader())
 
-@app.get("/api/data")
-async def get_data():
+@app.get("/telemetry")
+async def get_telemetry():
+    """Эндпоинт для получения текущего состояния телеметрии"""
     return storage
 
-
 if __name__ == "__main__":
+    # Запуск API на порту 8000
     uvicorn.run(app, host="0.0.0.0", port=8000)
